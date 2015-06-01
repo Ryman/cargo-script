@@ -19,6 +19,7 @@ extern crate env_logger;
 extern crate rustc_serialize;
 extern crate shaman;
 extern crate toml;
+extern crate regex;
 
 /**
 If this is set to `true`, the digests used for package IDs will be replaced with "stub" to make testing a bit easier.  Obviously, you don't want this `true` for release...
@@ -36,6 +37,7 @@ use std::fs;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 
 use error::{Blame, MainError};
 
@@ -323,6 +325,9 @@ fn try_main() -> Result<i32> {
 
     // Run it!
     let exe_path = get_exe_path(&input, &pkg_path, &meta);
+
+    // FIXME: exe_path may not exist which should be an internal error
+
     info!("executing {:?}", exe_path);
     Ok(try!(Command::new(exe_path).args(&args.args).status()
         .map(|st| st.code().unwrap_or(1))))
@@ -406,13 +411,34 @@ where P: AsRef<Path> {
         mani_path
     };
 
-    {
-        let script_path = pkg_path.join(input.safe_name()).with_extension("rs");
+    let script_path = pkg_path.join(input.safe_name()).with_extension("rs");
+
+    // If there is no main, then we can do some rust-doc-esque wrapping
+    if !script_str.contains("fn main") {
+        let lib_names = try!(extract_lib_names(&script_path,
+                                               &mani_path,
+                                               input.safe_name()));
+
+        try!(write_script_with_externs(&script_str, lib_names, &script_path));
+
+        // Seems like cargo wont recompile if we issue another build instantly
+        thread::sleep_ms(10000);
+    } else {
         let mut script_f = try!(fs::File::create(script_path));
         try!(write!(&mut script_f, "{}", script_str));
         try!(script_f.flush());
     }
 
+    try!(cargo_build(meta, &mani_path));
+
+    // Write out metadata *now*.  Remember that we check the timestamp in the metadata, *not* on the executable.
+    try!(write_pkg_metadata(pkg_path, meta));
+
+    cleanup_dir.disarm();
+    Ok(())
+}
+
+fn cargo_build(meta: &PackageMetadata, mani_path: &Path) -> Result<()> {
     // *bursts through wall* It's Cargo Time!
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
@@ -423,18 +449,71 @@ where P: AsRef<Path> {
         cmd.arg("--release");
     }
 
-    try!(cmd.status().map_err(|e| Into::<MainError>::into(e)).and_then(|st|
+    cmd.status().map_err(|e| Into::<MainError>::into(e)).and_then(|st|
         match st.code() {
             Some(0) => Ok(()),
             Some(st) => Err(format!("cargo failed with status {}", st).into()),
             None => Err("cargo failed".into())
-        }));
+    })
+}
 
-    // Write out metadata *now*.  Remember that we check the timestamp in the metadata, *not* on the executable.
-    try!(write_pkg_metadata(pkg_path, meta));
+fn capture_cargo_build(mani_path: &Path) -> Result<String> {
+    // *bursts through wall* It's Cargo Time!
+    let mut cmd = Command::new("cargo");
+    cmd.arg("build")
+        .arg("--verbose")
+        .arg("--manifest-path")
+        .arg(&*mani_path.to_string_lossy());
 
-    cleanup_dir.disarm();
+    cmd.output().map_err(|e| Into::<MainError>::into(e)).and_then(|output|
+        match output.status.code() {
+            Some(0) => Ok(String::from_utf8_lossy(&*output.stdout).to_string()),
+            Some(st) => Err(format!("cargo failed with status {}", st).into()),
+            None => Err("cargo failed".into())
+    })
+}
+
+fn write_script_with_externs(script_str: &str, lib_names: Vec<String>, script_path: &Path) -> Result<()> {
+    let mut script_f = try!(fs::File::create(&script_path));
+
+    for lib_name in lib_names {
+        try!(write!(&mut script_f, "extern crate {};\n", lib_name))
+    }
+
+    try!(write!(&mut script_f, "\nfn main() {{\n{}\n}}", script_str.trim()));
+    try!(script_f.flush());
     Ok(())
+}
+
+fn extract_lib_names(script_path: &Path, mani_path: &Path, crate_name: &str) -> Result<Vec<String>> {
+    // Write a dummy script
+    let mut script_f = try!(fs::File::create(script_path));
+    try!(write!(&mut script_f, "fn main() {{}}"));
+    try!(script_f.flush());
+
+    // Compile to capture `--extern`s provided by cargo
+    let stdout = try!(capture_cargo_build(&mani_path));
+
+    // FIXME: This should be more robust and match on the scriptname
+    let regex = format!("--crate-name {}(.*)`", crate_name);
+    let regex = regex::Regex::new(&regex).unwrap();
+
+    let rustc_cmd = match regex.captures(&stdout) {
+        Some(cap) => cap.at(1).unwrap(),
+        None => {
+            // This would probably be a failed dependency compile but that
+            // should be handled by a statuscode of non-zero from `cargo build`
+            unreachable!()
+        }
+    };
+
+    // Extract libnames from `--extern`s
+    let regex = regex::Regex::new(r#"--extern (.+?)="#).unwrap();
+    let lib_names = regex.captures_iter(&rustc_cmd)
+                         .map(|cap| cap.at(1).unwrap())
+                         .map(|s| s.to_owned())
+                         .collect();
+    Ok(lib_names)
 }
 
 /**
